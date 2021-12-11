@@ -1,0 +1,59 @@
+{% if result == 'failure' %}
+  <div class="alert alert-danger alert-dismissible">
+    <i class="fa fa-exclamation-circle"></i> 
+    {% for message in messages %}
+      <div>{{ message }}</div>
+    {% endfor %}
+    <button type="button" class="close" data-dismiss="alert">×</button>
+  </div>
+{% else %}
+  <div class="buttons">
+    <div class="pull-right">
+      <input type="button" value="{{ button_confirm }}" id="button-confirm" class="btn btn-primary" data-text="{{ button_confirm }}" data-loading-text="{{ text_loading }}" />
+    </div>
+  </div>
+{% endif %}
+
+<script>
+  var isTestMode = {{ isTestMode|json_encode() }};
+  var isFullRedirect = {{ isFullRedirect|json_encode() }};
+  var paymentData = {{ paymentData|json_encode() }};
+
+  $('#button-confirm').button('loading');
+
+  let script = document.createElement('script');
+  script.src = "https://pay.dnapayments.com/checkout/payment-api.js";
+  document.head.append(script);
+
+  script.onload = function() {
+    $('#button-confirm').button('reset');
+  };
+
+  function pay() {
+    $('#button-confirm').button('reset');
+
+    window.DNAPayments.configure({
+      isTestMode: isTestMode
+    });
+
+    if (isFullRedirect) {
+      window.DNAPayments.openPaymentPage(paymentData);
+    } else {
+      window.DNAPayments.openPaymentIframeWidget(paymentData);
+    }
+  }
+
+  $('#button-confirm').on('click', function() {
+    $.ajax({
+      type: 'get',
+      url: 'index.php?route=extension/payment/dna_payments/confirm',
+      cache: false,
+      beforeSend: function() {
+        $('#button-confirm').button('loading');
+      },
+      success: function() {
+        pay();
+      }
+    });
+  });
+</script>
