@@ -70,8 +70,8 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
       $data['result'] = 'success';
       $data['paymentData'] = array(
         'invoiceId' => $invoiceId,
-        'backLink' => $this->url->link('checkout/success'),
-        'failureBackLink' => $this->url->link('checkout/failure'),
+        'backLink' => $this->url->link('checkout/success', '', true),
+        'failureBackLink' => $this->url->link('checkout/failure', '', true),
         'postLink' => $this->getPostLink(),
         'failurePostLink' => $this->getPostLink(),
         'language' => 'eng', // $order_info['language_code'],
@@ -194,7 +194,7 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
 
   private function getPostLink()
   {
-    return $this->url->link('extension/payment/dna_payments/callback');
+    return $this->url->link('extension/payment/dna_payments/callback', '', true);
   }
 
   private function isValidSignature($result, $secret)
