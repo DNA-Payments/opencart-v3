@@ -131,27 +131,39 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
       return $this->log('error', 'No JSON response');
     }
 
-    $order_id = $response['invoiceId'];
-    if (!$order_id) {
-      return $this->log('error', 'order_id is missing.');
-    }
-
+    // Authenticate before looking up an order or invoking any CMS update hooks.
     if (!$this->isValidSignature($response, $this->getClientSecret())) {
       return $this->log('error', 'not valid signature');
     }
 
+    $order_id = (int)$response['invoiceId'];
     $this->load->model('checkout/order');
     $order_info = $this->model_checkout_order->getOrder($order_id);
-    if (!$order_info) {
-      return $this->log('error', 'Order ' . $order_id . ' is missing.');
+    if (!$order_info || $order_info['payment_code'] !== 'dna_payments') {
+      return $this->log('error', 'Unknown DNA Payments order');
     }
 
-    if ($response['success']) {
-      $this->model_checkout_order->addOrderHistory($order_id, $this->config->get('payment_dna_payments_order_status_paid_id'), '', TRUE);
-    } else {
-      $this->log('error', 'Order ' . $order_id . '. Error code: ' . $response['errorCode']);
-      $this->log('error', 'Order ' . $order_id . '. Error message: ' . $response['message']);
+    if ($response['success'] === false) {
+      return $this->log('error', 'Payment failed for order ' . $order_id);
     }
+    if (!isset($response['id']) || !is_string($response['id']) || trim($response['id']) === '') {
+      return $this->log('error', 'Missing transaction ID');
+    }
+    if (!$this->matchesOrder($response, $order_info)) {
+      return $this->log('error', 'Payment amount or currency mismatch');
+    }
+
+    $this->model_checkout_order->addOrderHistory($order_id, $this->config->get('payment_dna_payments_order_status_paid_id'), '', TRUE);
+  }
+
+  private function matchesOrder($payment, $order)
+  {
+    if (!isset($payment['currency'], $payment['amount']) || $payment['currency'] !== $order['currency_code']
+      || !is_numeric($payment['amount']) || !is_finite((float)$payment['amount'])) {
+      return false;
+    }
+    $expected = round((float)$order['total'], 2);
+    return (float)$payment['amount'] === $expected;
   }
 
   private function sendPost($url, array $data)
@@ -200,8 +212,22 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
 
   private function isValidSignature($result, $secret)
   {
-    $string = $result['id'] . $result['amount'] . $result['currency'] . $result['invoiceId'] . $result['errorCode'] . json_encode($result['success']);
-    return base64_encode(hash_hmac('sha256', $string, $secret, true)) == $result['signature'];
+    if (!is_array($result) || !is_string($secret) || $secret === ''
+      || !isset($result['signature']) || !is_string($result['signature'])
+      || $result['signature'] === ''
+      || !isset($result['success']) || !is_bool($result['success'])) {
+      return false;
+    }
+
+    if (!isset($result['invoiceId'])) {
+      return false;
+    }
+
+    $string = ($result['id'] ?? '') . ($result['amount'] ?? '') . ($result['currency'] ?? '')
+        . ($result['invoiceId'] ?? '') . ($result['errorCode'] ?? '') . json_encode($result['success'] ?? null);
+    $expected = base64_encode(hash_hmac('sha256', $string, $secret, true));
+
+    return hash_equals($expected, $result['signature']);
   }
 
   private function getClientSecret() {
