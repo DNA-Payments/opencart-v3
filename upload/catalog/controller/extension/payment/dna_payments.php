@@ -1,5 +1,9 @@
 <?php
 class ControllerExtensionPaymentDNAPayments extends Controller {
+  const PLUGIN_VERSION = '2.0.2';
+  const TELEMETRY_API_URL_PROD = 'https://telemetry-api.dnapayments.com/v1/cms-plugins-versions';
+  const TELEMETRY_API_URL_TEST = 'https://test-telemetry-api.dnapayments.com/v1/cms-plugins-versions';
+  const ANALYTICS_HASH_FILE = 'dna_payments_analytics_hash.txt';
 
   public function index() {
     $this->load->language('extension/payment/dna_payments');
@@ -18,7 +22,7 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
     $has_shipping = !empty($order_info['shipping_code']);
     $invoiceId = strval($order_id);
     $terminal = $is_test_mode ? $this->config->get('payment_dna_payments_test_terminal') : $this->config->get('payment_dna_payments_terminal');
-    $amount = round((float)$order_info['total'], 2);
+    $amount = $this->orderAmount($order_info['total'], $order_info);
     $currency = $order_info['currency_code'];
 
     $data['isTestMode'] = $is_test_mode;
@@ -50,8 +54,8 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
         'reference' => $p['product_id'],
         'name' => $p['name'],
         'quantity' => (float)$p['quantity'],
-        'unitPrice' => round((float)$p['price'], 2),
-        'totalAmount' => round((float)$p['total'], 2)
+        'unitPrice' => $this->orderAmount($p['price'], $order_info),
+        'totalAmount' => $this->orderAmount($p['total'], $order_info)
       );
     }
 
@@ -100,10 +104,10 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
         ) : null,
         'orderLines' => $orderLines,
         'amountBreakdown' => array(
-          'itemTotal' => array('totalAmount' => round($itemTotal, 2)),
-          'shipping' => array('totalAmount' => round($shippingTotal, 2)),
-          'handling' => array('totalAmount' => round($handlingTotal, 2)),
-          'taxTotal' => array('totalAmount' => round($taxTotal, 2))
+          'itemTotal' => array('totalAmount' => $this->orderAmount($itemTotal, $order_info)),
+          'shipping' => array('totalAmount' => $this->orderAmount($shippingTotal, $order_info)),
+          'handling' => array('totalAmount' => $this->orderAmount($handlingTotal, $order_info)),
+          'taxTotal' => array('totalAmount' => $this->orderAmount($taxTotal, $order_info))
         ),
         'shippingPreference' => $has_shipping ? '' : 'NO_SHIPPING',
         'auth' => $response['response']
@@ -136,10 +140,20 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
       return $this->log('error', 'not valid signature');
     }
 
-    $order_id = (int)$response['invoiceId'];
+    $this->sendAnalytics();
+
+    // This integration uses an existing OpenCart order as its payment attempt.
+    // Do not let OpenCart's integer cast alias a different signed invoice.
+    $invoice = $response['invoiceId'];
+    if (!is_string($invoice) || !preg_match('/^[1-9][0-9]*$/D', $invoice)
+      || (string)(int)$invoice !== $invoice) {
+      return $this->log('error', 'Invalid invoice reference');
+    }
+    $order_id = (int)$invoice;
     $this->load->model('checkout/order');
     $order_info = $this->model_checkout_order->getOrder($order_id);
-    if (!$order_info || $order_info['payment_code'] !== 'dna_payments') {
+    if (!$order_info || $order_info['payment_code'] !== 'dna_payments'
+      || (int)$order_info['store_id'] !== (int)$this->config->get('config_store_id')) {
       return $this->log('error', 'Unknown DNA Payments order');
     }
 
@@ -153,26 +167,104 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
       return $this->log('error', 'Payment amount or currency mismatch');
     }
 
+    // settled and transactionState are NOT included in the callback HMAC.
+    $transaction = $this->getTransaction($response['id']);
+    if (!is_array($transaction) || !isset($transaction['invoiceId'], $transaction['transactionState'], $transaction['payoutAmount'])
+      || $transaction['invoiceId'] !== $invoice
+      || $transaction['transactionState'] !== 'CHARGE'
+      || !$this->matchesOrder($transaction, $order_info)
+      || !$this->matchesOrder(array('amount' => $transaction['payoutAmount'], 'currency' => $transaction['currency']), $order_info)) {
+      return $this->log('error', 'Capture not verified; order left pending');
+    }
+
     $this->model_checkout_order->addOrderHistory($order_id, $this->config->get('payment_dna_payments_order_status_paid_id'), '', TRUE);
+  }
+
+  private function orderAmount($amount, $order)
+  {
+    return $this->currency->format($amount, $order['currency_code'], $order['currency_value'], false);
   }
 
   private function matchesOrder($payment, $order)
   {
     if (!isset($payment['currency'], $payment['amount']) || $payment['currency'] !== $order['currency_code']
-      || !is_numeric($payment['amount']) || !is_finite((float)$payment['amount'])) {
+      || !$this->currency->has($order['currency_code'])) {
       return false;
     }
-    $expected = round((float)$order['total'], 2);
-    return (float)$payment['amount'] === $expected;
+    $precision = (int)$this->currency->getDecimalPlace($order['currency_code']);
+    $expected = $this->moneyValue($this->orderAmount($order['total'], $order), $precision);
+    return $expected !== false && $this->moneyValue($payment['amount'], $precision) === $expected;
   }
 
-  private function sendPost($url, array $data)
+  // Compare decimal strings, rejecting fractional minor units instead of rounding
+  // an underpayment up. JSON numbers and decimal strings are both supported.
+  private function moneyValue($amount, $precision)
+  {
+    if ((!is_string($amount) && !is_int($amount) && !is_float($amount))
+      || !preg_match('/^([0-9]+)(?:\.([0-9]+))?$/D', (string)$amount, $parts)) {
+      return false;
+    }
+    $fraction = isset($parts[2]) ? $parts[2] : '';
+    if (trim(substr($fraction, $precision), '0') !== '') {
+      return false;
+    }
+    return (ltrim($parts[1], '0') ?: '0') . '.' . str_pad(substr($fraction, 0, $precision), $precision, '0');
+  }
+
+  private function getTransaction($id)
+  {
+    $token = $this->getApiToken();
+    if ($token === null) {
+      return null;
+    }
+    $is_test_mode = $this->config->get('payment_dna_payments_test_mode') == '1';
+    $url = ($is_test_mode ? 'https://test-api.dnapayments.com' : 'https://api.dnapayments.com')
+      . '/transaction/' . rawurlencode($id) . '/search';
+    return $this->sendGet($url, $token);
+  }
+
+  // Access token for the DNA web API (transaction lookup, telemetry).
+  private function getApiToken()
+  {
+    $is_test_mode = $this->config->get('payment_dna_payments_test_mode') == '1';
+    $auth = $this->sendPost($this->getAuthUrl(), array(
+      'grant_type' => 'client_credentials',
+      'scope' => 'webapi',
+      'client_id' => $this->config->get($is_test_mode ? 'payment_dna_payments_test_client_id' : 'payment_dna_payments_client_id'),
+      'client_secret' => $this->getClientSecret()
+    ));
+    if (!$auth || $auth['status'] < 200 || $auth['status'] >= 300
+      || empty($auth['response']['access_token']) || !is_string($auth['response']['access_token'])) {
+      return null;
+    }
+    return $auth['response']['access_token'];
+  }
+
+  protected function sendGet($url, $token)
+  {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, array(
+      CURLOPT_RETURNTRANSFER => TRUE,
+      CURLOPT_CONNECTTIMEOUT => 10,
+      CURLOPT_TIMEOUT => 30,
+      CURLOPT_HTTPHEADER => array('Accept: application/json', 'Authorization: Bearer ' . $token)
+    ));
+    $body = curl_exec($ch);
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $result = !curl_errno($ch) && $status >= 200 && $status < 300 ? json_decode($body, TRUE) : null;
+    curl_close($ch);
+    return $result;
+  }
+
+  protected function sendPost($url, array $data)
   {
     // Setup cURL
     $ch = curl_init($url);
     curl_setopt_array($ch, array(
       CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
       CURLOPT_POST => TRUE,
+      CURLOPT_CONNECTTIMEOUT => 10,
+      CURLOPT_TIMEOUT => 30,
       CURLOPT_RETURNTRANSFER => TRUE,
       CURLOPT_HTTPHEADER => array(
         'Content-Type: application/x-www-form-urlencoded'
@@ -201,6 +293,91 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
     return $result;
   }
 
+  /**
+   * Sends plugin and platform versions to the DNA telemetry API, the same way the
+   * WooCommerce, Magento 2 and PrestaShop plugins do. Data is sent only when it
+   * changed since the last successful send; errors are logged and never break the callback.
+   */
+  private function sendAnalytics()
+  {
+    try {
+      $is_test_mode = $this->config->get('payment_dna_payments_test_mode') == '1';
+      $client_id = $this->config->get($is_test_mode ? 'payment_dna_payments_test_client_id' : 'payment_dna_payments_client_id');
+      $client_secret = $this->getClientSecret();
+      if (empty($client_id) || empty($client_secret)) {
+        return;
+      }
+
+      $data = $this->getAnalyticsData($is_test_mode);
+      $hash = hash('sha256', json_encode($data));
+      $hash_file = $this->getAnalyticsHashFile();
+
+      if (is_file($hash_file) && file_get_contents($hash_file) === $hash) {
+        return;
+      }
+
+      $token = $this->getApiToken();
+      if ($token === null) {
+        throw new \Exception('Could not get DNA access token');
+      }
+
+      $this->sendTelemetry($token, $data, $is_test_mode);
+
+      file_put_contents($hash_file, $hash);
+    } catch (\Throwable $e) {
+      $this->log('analytics error', $e->getMessage());
+    }
+  }
+
+  private function getAnalyticsData($is_test_mode)
+  {
+    $host = !empty($this->request->server['HTTP_HOST'])
+      ? $this->request->server['HTTP_HOST']
+      : parse_url(HTTPS_SERVER, PHP_URL_HOST);
+
+    return array(
+      'integrationType' => $this->config->get('payment_dna_payments_type') == '1' ? 'hosted' : 'embedded',
+      'terminalId' => $this->config->get($is_test_mode ? 'payment_dna_payments_test_terminal' : 'payment_dna_payments_terminal'),
+      'phpVersion' => phpversion(),
+      'domainName' => $host,
+      'pluginVersion' => self::PLUGIN_VERSION,
+      'cmsPlatformName' => 'OpenCart',
+      'cmsPlatformVersion' => VERSION
+    );
+  }
+
+  private function getAnalyticsHashFile()
+  {
+    return (defined('DIR_STORAGE') ? DIR_STORAGE : DIR_CACHE) . self::ANALYTICS_HASH_FILE;
+  }
+
+  private function sendTelemetry($token, array $data, $is_test_mode)
+  {
+    $ch = curl_init($is_test_mode ? self::TELEMETRY_API_URL_TEST : self::TELEMETRY_API_URL_PROD);
+    curl_setopt_array($ch, array(
+      CURLOPT_POST => TRUE,
+      CURLOPT_RETURNTRANSFER => TRUE,
+      CURLOPT_CONNECTTIMEOUT => 10,
+      CURLOPT_TIMEOUT => 10,
+      CURLOPT_HTTPHEADER => array(
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $token
+      ),
+      CURLOPT_POSTFIELDS => json_encode($data)
+    ));
+    $body = curl_exec($ch);
+    $error = curl_errno($ch) ? curl_error($ch) : null;
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($error !== null) {
+      throw new \Exception('Telemetry request failed: ' . $error);
+    }
+    if ($status !== 200) {
+      throw new \Exception('Telemetry API Error [' . $status . ']: ' . $body);
+    }
+  }
+
   private function log($method, $message) {
     $this->log->write('dna_payments ' . $method . '. ' . print_r($message, true));
   }
@@ -219,6 +396,11 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
       return false;
     }
 
+    foreach (array('id', 'amount', 'currency', 'invoiceId', 'errorCode') as $field) {
+      if (isset($result[$field]) && !is_scalar($result[$field])) {
+        return false;
+      }
+    }
     if (!isset($result['invoiceId'])) {
       return false;
     }
