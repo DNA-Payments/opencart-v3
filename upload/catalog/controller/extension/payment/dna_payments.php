@@ -1,5 +1,9 @@
 <?php
 class ControllerExtensionPaymentDNAPayments extends Controller {
+  const PLUGIN_VERSION = '2.0.2';
+  const TELEMETRY_API_URL_PROD = 'https://telemetry-api.dnapayments.com/v1/cms-plugins-versions';
+  const TELEMETRY_API_URL_TEST = 'https://test-telemetry-api.dnapayments.com/v1/cms-plugins-versions';
+  const ANALYTICS_HASH_FILE = 'dna_payments_analytics_hash.txt';
 
   public function index() {
     $this->load->language('extension/payment/dna_payments');
@@ -135,6 +139,8 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
     if (!$this->isValidSignature($response, $this->getClientSecret())) {
       return $this->log('error', 'not valid signature');
     }
+
+    $this->sendAnalytics();
 
     // This integration uses an existing OpenCart order as its payment attempt.
     // Do not let OpenCart's integer cast alias a different signed invoice.
@@ -285,6 +291,91 @@ class ControllerExtensionPaymentDNAPayments extends Controller {
 
     curl_close($ch);
     return $result;
+  }
+
+  /**
+   * Sends plugin and platform versions to the DNA telemetry API, the same way the
+   * WooCommerce, Magento 2 and PrestaShop plugins do. Data is sent only when it
+   * changed since the last successful send; errors are logged and never break the callback.
+   */
+  private function sendAnalytics()
+  {
+    try {
+      $is_test_mode = $this->config->get('payment_dna_payments_test_mode') == '1';
+      $client_id = $this->config->get($is_test_mode ? 'payment_dna_payments_test_client_id' : 'payment_dna_payments_client_id');
+      $client_secret = $this->getClientSecret();
+      if (empty($client_id) || empty($client_secret)) {
+        return;
+      }
+
+      $data = $this->getAnalyticsData($is_test_mode);
+      $hash = hash('sha256', json_encode($data));
+      $hash_file = $this->getAnalyticsHashFile();
+
+      if (is_file($hash_file) && file_get_contents($hash_file) === $hash) {
+        return;
+      }
+
+      $token = $this->getApiToken();
+      if ($token === null) {
+        throw new \Exception('Could not get DNA access token');
+      }
+
+      $this->sendTelemetry($token, $data, $is_test_mode);
+
+      file_put_contents($hash_file, $hash);
+    } catch (\Throwable $e) {
+      $this->log('analytics error', $e->getMessage());
+    }
+  }
+
+  private function getAnalyticsData($is_test_mode)
+  {
+    $host = !empty($this->request->server['HTTP_HOST'])
+      ? $this->request->server['HTTP_HOST']
+      : parse_url(HTTPS_SERVER, PHP_URL_HOST);
+
+    return array(
+      'integrationType' => $this->config->get('payment_dna_payments_type') == '1' ? 'hosted' : 'embedded',
+      'terminalId' => $this->config->get($is_test_mode ? 'payment_dna_payments_test_terminal' : 'payment_dna_payments_terminal'),
+      'phpVersion' => phpversion(),
+      'domainName' => $host,
+      'pluginVersion' => self::PLUGIN_VERSION,
+      'cmsPlatformName' => 'OpenCart',
+      'cmsPlatformVersion' => VERSION
+    );
+  }
+
+  private function getAnalyticsHashFile()
+  {
+    return (defined('DIR_STORAGE') ? DIR_STORAGE : DIR_CACHE) . self::ANALYTICS_HASH_FILE;
+  }
+
+  private function sendTelemetry($token, array $data, $is_test_mode)
+  {
+    $ch = curl_init($is_test_mode ? self::TELEMETRY_API_URL_TEST : self::TELEMETRY_API_URL_PROD);
+    curl_setopt_array($ch, array(
+      CURLOPT_POST => TRUE,
+      CURLOPT_RETURNTRANSFER => TRUE,
+      CURLOPT_CONNECTTIMEOUT => 10,
+      CURLOPT_TIMEOUT => 10,
+      CURLOPT_HTTPHEADER => array(
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $token
+      ),
+      CURLOPT_POSTFIELDS => json_encode($data)
+    ));
+    $body = curl_exec($ch);
+    $error = curl_errno($ch) ? curl_error($ch) : null;
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($error !== null) {
+      throw new \Exception('Telemetry request failed: ' . $error);
+    }
+    if ($status !== 200) {
+      throw new \Exception('Telemetry API Error [' . $status . ']: ' . $body);
+    }
   }
 
   private function log($method, $message) {
